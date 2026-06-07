@@ -202,10 +202,10 @@ input[type=file]{display:none}
       ondragover="dragOver(event,'qp-box')" ondragleave="dragLeave('qp-box')" ondrop="dropFile(event,'qp')">
       <div class="upload-icon">📊</div>
       <h3>Click to upload or drag & drop</h3>
-      <p>Excel file (.xlsx or .xls) with questions and answer key</p>
+      <p>Excel (.xlsx, .xls, .csv), PDF, or Images (PNG, JPG, JPEG)</p>
       <div class="loaded-name" id="qp-name" style="display:none"></div>
     </div>
-    <input type="file" id="qp-input" accept=".xlsx,.xls,.csv" onchange="loadFile('qp',this)">
+    <input type="file" id="qp-input" accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg" onchange="loadFile('qp',this)">
     <div class="err-msg" id="qp-err"></div>
     <div class="ok-msg"  id="qp-ok"></div>
   </div>
@@ -421,18 +421,94 @@ function dragOver(e, id) { e.preventDefault(); document.getElementById(id).class
 function dragLeave(id)   { document.getElementById(id).classList.remove('drag'); }
 
 function readFileBytes(file, type) {
-  const reader = new FileReader();
-  reader.onload = e => {
-    try {
-      const data = new Uint8Array(e.target.result);
-      const wb   = XLSX.read(data, {type:'array'});
-      const ws   = wb.Sheets[wb.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-      if(type==='qp') parseQP(rows, file.name);
-      else            parseSA(rows, file.name);
-    } catch(err) { showErr(type, 'Could not read file: '+err.message); }
-  };
-  reader.readAsArrayBuffer(file);
+  const ext = file.name.split('.').pop().toLowerCase();
+  
+  if (type === 'qp' && !['xlsx', 'xls', 'csv'].includes(ext)) {
+    // PDF / Image / Document parsing via AI
+    const reader = new FileReader();
+    reader.onload = async (e) => {
+      const base64Data = e.target.result.split(',')[1];
+      const mimeType = file.type || 'application/pdf';
+      
+      const qpName = document.getElementById('qp-name');
+      const qpBox = document.getElementById('qp-box');
+      qpName.textContent = '🧠 AI is reading and extracting questions... Please wait.';
+      qpName.style.display = 'block';
+      qpName.style.color = 'var(--primary)';
+      qpBox.classList.add('drag');
+      
+      try {
+        const response = await fetch('/api/extract-questions', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ fileData: base64Data, mimeType })
+        });
+        const data = await response.json();
+        
+        if (data.error) throw new Error(data.error);
+        if (!data.results || data.results.length === 0) throw new Error("No questions extracted by AI.");
+        
+        parseAIQuestions(data.results, file.name);
+      } catch (err) {
+        showErr('qp', 'AI Extraction Error: ' + err.message);
+        qpName.style.display = 'none';
+        qpBox.classList.remove('drag');
+      }
+    };
+    reader.readAsDataURL(file);
+  } else {
+    // Normal Excel parsing
+    const reader = new FileReader();
+    reader.onload = e => {
+      try {
+        const data = new Uint8Array(e.target.result);
+        const wb   = XLSX.read(data, {type:'array'});
+        const ws   = wb.Sheets[wb.SheetNames[0]];
+        const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+        if(type==='qp') parseQP(rows, file.name);
+        else            parseSA(rows, file.name);
+      } catch(err) { showErr(type, 'Could not read file: '+err.message); }
+    };
+    reader.readAsArrayBuffer(file);
+  }
+}
+
+function parseAIQuestions(results, fname) {
+  hideMsg('qp');
+  const questions = [];
+  results.forEach((r, idx) => {
+    const ans = String(r.ans || '?').toUpperCase();
+    const ansValid = ['A','B','C','D'].includes(ans);
+    questions.push({
+      qno: String(r.qno || ('Q' + (idx + 1))),
+      text: String(r.text || ''),
+      chapter: String(r.chapter || 'Unknown'),
+      sub: String(r.subConcept || ''),
+      errorType: String(r.errorType || 'Memory'),
+      ans: ansValid ? ans : '?',
+      needsTagging: false,
+      cognitiveLevel: '—', ncertDirectness: '—', formatType: '—', targetTime: '—'
+    });
+  });
+
+  if(questions.length===0) {
+    showErr('qp', 'No questions could be extracted from this document by the AI.');
+    document.getElementById('qp-name').style.display = 'none';
+    document.getElementById('qp-box').classList.remove('loaded');
+    return;
+  }
+
+  QP = {questions, chapGroups:{}, chapColors:{}};
+  buildChapGroups();
+
+  document.getElementById('qp-name').textContent = '✓ '+fname+' — '+questions.length+' questions loaded via AI';
+  document.getElementById('qp-name').style.display='block';
+  document.getElementById('qp-name').style.color = '#166534';
+  document.getElementById('qp-box').classList.remove('drag');
+  document.getElementById('qp-box').classList.add('loaded');
+  
+  showOk('qp', 'Successfully extracted ' + questions.length + ' questions across ' + Object.keys(QP.chapGroups).length + ' chapters using Gemini AI.');
+  renderQPPreview(true);
 }
 
 // ══════════════════════════════════════════════════════════════

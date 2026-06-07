@@ -243,6 +243,80 @@ Format: [{"qno": "1", "chapter": "Cell Biology", "difficulty": "Medium", "reason
     }
 });
 
+// API Endpoint for Document Question Extraction (PDF/OCR/Text)
+app.post('/api/extract-questions', async (req, res) => {
+    try {
+        const { fileData, mimeType, textContent } = req.body;
+        
+        const apiKey = process.env.GEMINI_API_KEY;
+        if (!apiKey) {
+            return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server.' });
+        }
+
+        let promptText = `You are a NEET UG exam parser. Your job is to extract all questions from this exam paper (PDF or image).
+For each question, output:
+1. "qno": The question number (e.g., "1", "2").
+2. "text": The text of the question (the question stem).
+3. "chapter": The primary chemistry/physics/biology chapter name (e.g., Digestion, Kinematics, Cell Biology).
+4. "subConcept": The specific sub-topic or concept within that chapter.
+5. "errorType": Classify the question as either "Memory" (rote fact), "Conceptual" (understanding principles), or "Application" (calculating/applying formulas).
+6. "ans": The correct answer option: A, B, C, or D. If the document has an answer key (e.g., at the end of the document), use it. Otherwise, solve the question to determine the correct answer.
+
+Return the result STRICTLY as a JSON array of objects. Do not include markdown formatting or any other text.
+Format: [{"qno": "1", "text": "What is the unit of force?", "chapter": "Laws of Motion", "subConcept": "Newton's Laws", "errorType": "Memory", "ans": "B"}]`;
+
+        const requestBody = {
+            contents: [{ parts: [{ text: promptText }] }],
+            generationConfig: {
+                temperature: 0.2,
+                responseMimeType: "application/json"
+            }
+        };
+
+        if (fileData && mimeType) {
+            requestBody.contents[0].parts.push({
+                inlineData: {
+                    mimeType: mimeType,
+                    data: fileData
+                }
+            });
+        } else if (textContent) {
+            requestBody.contents[0].parts.push({ text: `\n\nDocument Content:\n${textContent}` });
+        } else {
+            return res.status(400).json({ error: 'No file data or text content provided.' });
+        }
+
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(requestBody)
+        });
+
+        const data = await response.json();
+
+        if (data.error) {
+            console.error("Gemini API Error:", data.error);
+            const isRateLimit = data.error.code === 429 || String(data.error.message).includes('429') || String(data.error.message).toLowerCase().includes('exhausted');
+            const statusCode = isRateLimit ? 429 : 500;
+            return res.status(statusCode).json({ error: data.error.message || 'AI provider error.' });
+        }
+
+        const rawText = data.candidates[0].content.parts[0].text;
+        
+        try {
+            const parsedResults = JSON.parse(rawText);
+            return res.json({ results: parsedResults });
+        } catch (parseError) {
+            console.error("Failed to parse JSON from AI:", rawText);
+            return res.status(500).json({ error: 'Failed to parse AI response.' });
+        }
+
+    } catch (error) {
+        console.error("Server Error:", error);
+        res.status(500).json({ error: 'Internal server error.' });
+    }
+});
+
 // API Endpoint for generating AI Pedagogical Prescription
 app.post('/api/generate-prescription', async (req, res) => {
     try {
