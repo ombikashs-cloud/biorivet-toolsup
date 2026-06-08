@@ -6,6 +6,7 @@
 <title>BioRivet – NEET Diagnostic Tool</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -202,10 +203,10 @@ input[type=file]{display:none}
       ondragover="dragOver(event,'qp-box')" ondragleave="dragLeave('qp-box')" ondrop="dropFile(event,'qp')">
       <div class="upload-icon">📊</div>
       <h3>Click to upload or drag & drop</h3>
-      <p>Excel (.xlsx, .xls, .csv), PDF, or Images (PNG, JPG, JPEG)</p>
+      <p>Excel (.xlsx, .xls, .csv), PDF, Word (.docx, .doc), or Images (PNG, JPG, JPEG)</p>
       <div class="loaded-name" id="qp-name" style="display:none"></div>
     </div>
-    <input type="file" id="qp-input" accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg" onchange="loadFile('qp',this)">
+    <input type="file" id="qp-input" accept=".xlsx,.xls,.csv,.pdf,.png,.jpg,.jpeg,.docx,.doc" onchange="loadFile('qp',this)">
     <div class="err-msg" id="qp-err"></div>
     <div class="ok-msg"  id="qp-ok"></div>
   </div>
@@ -420,57 +421,135 @@ function dropFile(e, type) {
 function dragOver(e, id) { e.preventDefault(); document.getElementById(id).classList.add('drag'); }
 function dragLeave(id)   { document.getElementById(id).classList.remove('drag'); }
 
+async function fetchWithRetry(url, options, retries = 3, backoff = 5000) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      const response = await fetch(url, options);
+      const data = await response.json();
+      
+      if (response.status === 429 || (data.error && String(data.error.message || data.error).includes('429'))) {
+        if (i < retries) {
+          console.warn(`Rate limit (429) hit. Retrying in ${backoff/1000} seconds...`);
+          await new Promise(resolve => setTimeout(resolve, backoff));
+          backoff *= 2; // Exponential backoff
+          continue;
+        }
+      }
+      return data;
+    } catch (err) {
+      if (i === retries) throw err;
+      await new Promise(resolve => setTimeout(resolve, backoff));
+    }
+  }
+}
+
 function readFileBytes(file, type) {
   const ext = file.name.split('.').pop().toLowerCase();
   
-  if (type === 'qp' && !['xlsx', 'xls', 'csv'].includes(ext)) {
-    // PDF / Image / Document parsing via AI
-    const reader = new FileReader();
-    reader.onload = async (e) => {
-      const base64Data = e.target.result.split(',')[1];
-      const mimeType = file.type || 'application/pdf';
-      
-      const qpName = document.getElementById('qp-name');
-      const qpBox = document.getElementById('qp-box');
-      qpName.textContent = '🧠 AI is reading and extracting questions... Please wait.';
-      qpName.style.display = 'block';
-      qpName.style.color = 'var(--primary)';
-      qpBox.classList.add('drag');
-      
-      try {
-        const response = await fetch('/api/extract-questions', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileData: base64Data, mimeType })
-        });
-        const data = await response.json();
+  if (type === 'qp') {
+    if (ext === 'docx') {
+      parseDocx(file, type);
+      return;
+    }
+    if (ext === 'doc') {
+      showErr('qp', 'Older Word (.doc) files are not supported directly. Please convert your file to .docx or .pdf for AI extraction.');
+      return;
+    }
+    
+    if (!['xlsx', 'xls', 'csv'].includes(ext)) {
+      // PDF / Image / Document parsing via AI
+      const reader = new FileReader();
+      reader.onload = async (e) => {
+        const base64Data = e.target.result.split(',')[1];
+        const mimeType = file.type || 'application/pdf';
         
-        if (data.error) throw new Error(data.error);
-        if (!data.results || data.results.length === 0) throw new Error("No questions extracted by AI.");
+        const qpName = document.getElementById('qp-name');
+        const qpBox = document.getElementById('qp-box');
+        qpName.textContent = '🧠 AI is reading and extracting questions... Please wait.';
+        qpName.style.display = 'block';
+        qpName.style.color = 'var(--primary)';
+        qpBox.classList.add('drag');
         
-        parseAIQuestions(data.results, file.name);
-      } catch (err) {
-        showErr('qp', 'AI Extraction Error: ' + err.message);
+        try {
+          const data = await fetchWithRetry('/api/extract-questions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fileData: base64Data, mimeType })
+          });
+          
+          if (data.error) throw new Error(data.error);
+          if (!data.results || data.results.length === 0) throw new Error("No questions extracted by AI.");
+          
+          parseAIQuestions(data.results, file.name);
+        } catch (err) {
+          showErr('qp', 'AI Extraction Error: ' + err.message);
+          qpName.style.display = 'none';
+          qpBox.classList.remove('drag');
+        }
+      };
+      reader.readAsDataURL(file);
+      return;
+    }
+  }
+
+  // Normal Excel parsing
+  const reader = new FileReader();
+  reader.onload = e => {
+    try {
+      const data = new Uint8Array(e.target.result);
+      const wb   = XLSX.read(data, {type:'array'});
+      const ws   = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
+      if(type==='qp') parseQP(rows, file.name);
+      else            parseSA(rows, file.name);
+    } catch(err) { showErr(type, 'Could not read file: '+err.message); }
+  };
+  reader.readAsArrayBuffer(file);
+}
+
+function parseDocx(file, type) {
+  const reader = new FileReader();
+  reader.onload = function(e) {
+    const arrayBuffer = e.target.result;
+    
+    const qpName = document.getElementById('qp-name');
+    const qpBox = document.getElementById('qp-box');
+    qpName.textContent = '🧠 AI is reading and extracting questions from Word file... Please wait.';
+    qpName.style.display = 'block';
+    qpName.style.color = 'var(--primary)';
+    qpBox.classList.add('drag');
+    
+    mammoth.extractRawText({ arrayBuffer: arrayBuffer })
+      .then(async function(result) {
+        const text = result.value; // The raw text
+        if (!text || text.trim().length === 0) {
+          throw new Error("The Word document appears to be empty or contains no extractable text.");
+        }
+        
+        try {
+          const data = await fetchWithRetry('/api/extract-questions', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ textContent: text })
+          });
+          
+          if (data.error) throw new Error(data.error);
+          if (!data.results || data.results.length === 0) throw new Error("No questions extracted by AI.");
+          
+          parseAIQuestions(data.results, file.name);
+        } catch (err) {
+          showErr('qp', 'AI Extraction Error: ' + err.message);
+          qpName.style.display = 'none';
+          qpBox.classList.remove('drag');
+        }
+      })
+      .catch(function(err) {
+        showErr('qp', 'Word File Error: ' + err.message);
         qpName.style.display = 'none';
         qpBox.classList.remove('drag');
-      }
-    };
-    reader.readAsDataURL(file);
-  } else {
-    // Normal Excel parsing
-    const reader = new FileReader();
-    reader.onload = e => {
-      try {
-        const data = new Uint8Array(e.target.result);
-        const wb   = XLSX.read(data, {type:'array'});
-        const ws   = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(ws, {header:1, defval:''});
-        if(type==='qp') parseQP(rows, file.name);
-        else            parseSA(rows, file.name);
-      } catch(err) { showErr(type, 'Could not read file: '+err.message); }
-    };
-    reader.readAsArrayBuffer(file);
-  }
+      });
+  };
+  reader.readAsArrayBuffer(file);
 }
 
 function parseAIQuestions(results, fname) {
